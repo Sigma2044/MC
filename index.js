@@ -1,4 +1,3 @@
-
 const {
     Client,
     GatewayIntentBits,
@@ -537,4 +536,3 @@ process.on(
 // =====================================================
 
 client.login(TOKEN);
-
