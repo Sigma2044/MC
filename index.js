@@ -1,4 +1,4 @@
-```js
+
 const {
     Client,
     GatewayIntentBits,
@@ -12,31 +12,30 @@ const {
     AudioPlayerStatus,
     VoiceConnectionStatus,
     NoSubscriberBehavior,
+    StreamType,
     entersState
 } = require("@discordjs/voice");
 
-const path = require("node:path");
-const fs = require("node:fs");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
 
 // =====================================================
-// EINSTELLUNGEN
+// ENVIRONMENT VARIABLES
 // =====================================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
-// Lautstärke: 0.0 = lautlos | 1.0 = volle Lautstärke
-const VOLUME = Number(process.env.VOLUME || "0.35");
+const YOUTUBE_URL =
+    process.env.YOUTUBE_URL ||
+    "https://www.youtube.com/watch?v=8v7-7g0LhAU";
 
-const AUDIO_FILE = path.join(
-    __dirname,
-    "audio",
-    "audio.mp3"
-);
+const VOLUME =
+    Number(process.env.VOLUME || "0.35");
 
 // =====================================================
-// KONFIGURATION PRÜFEN
+// CHECK
 // =====================================================
 
 if (!TOKEN) {
@@ -54,18 +53,15 @@ if (!VOICE_CHANNEL_ID) {
     process.exit(1);
 }
 
-if (!fs.existsSync(AUDIO_FILE)) {
-    console.error("❌ audio/audio.mp3 wurde nicht gefunden!");
-    process.exit(1);
-}
-
-if (VOLUME < 0 || VOLUME > 1) {
-    console.error("❌ VOLUME muss zwischen 0 und 1 liegen!");
-    process.exit(1);
-}
+console.log("=================================");
+console.log("     MINECRAFT CHILL RADIO");
+console.log("=================================");
+console.log(`🎵 URL: ${YOUTUBE_URL}`);
+console.log(`🔊 Lautstärke: ${VOLUME * 100}%`);
+console.log("=================================");
 
 // =====================================================
-// DISCORD CLIENT
+// DISCORD
 // =====================================================
 
 const client = new Client({
@@ -75,10 +71,6 @@ const client = new Client({
     ]
 });
 
-// =====================================================
-// AUDIO PLAYER
-// =====================================================
-
 const player = createAudioPlayer({
     behaviors: {
         noSubscriber: NoSubscriberBehavior.Play
@@ -86,126 +78,231 @@ const player = createAudioPlayer({
 });
 
 let connection = null;
-let reconnecting = false;
+let ytProcess = null;
+let ffmpegProcess = null;
+let restarting = false;
 
 // =====================================================
-// AUDIO RESOURCE
+// START STREAM
 // =====================================================
 
-function createMusicResource() {
-    const resource = createAudioResource(AUDIO_FILE, {
-        inlineVolume: true
-    });
+function startStream() {
 
-    resource.volume.setVolume(VOLUME);
+    if (restarting) return;
 
-    return resource;
-}
+    restarting = true;
 
-// =====================================================
-// AUDIO STARTEN
-// =====================================================
+    console.log("🎵 Starte YouTube Audio Stream...");
 
-function playMusic() {
-    try {
-        console.log("🎵 Starte Minecraft Chill Radio...");
-
-        const resource = createMusicResource();
-
-        player.play(resource);
-
-    } catch (error) {
-        console.error("❌ Fehler beim Starten der Musik:", error);
-
-        setTimeout(playMusic, 5000);
+    // Alte Prozesse beenden
+    if (ytProcess) {
+        try {
+            ytProcess.kill("SIGKILL");
+        } catch {}
     }
-}
 
-// =====================================================
-// VOICE CHANNEL BETRETEN
-// =====================================================
+    if (ffmpegProcess) {
+        try {
+            ffmpegProcess.kill("SIGKILL");
+        } catch {}
+    }
 
-async function connectToVoice() {
+    // =================================================
+    // YT-DLP
+    // =================================================
 
-    if (reconnecting) return;
-
-    reconnecting = true;
-
-    try {
-
-        const guild = await client.guilds.fetch(GUILD_ID);
-
-        const channel = await guild.channels.fetch(
-            VOICE_CHANNEL_ID
-        );
-
-        if (!channel) {
-            throw new Error("Voice-Channel nicht gefunden.");
+    ytProcess = spawn(
+        "yt-dlp",
+        [
+            "--no-playlist",
+            "--quiet",
+            "--no-warnings",
+            "-f",
+            "bestaudio",
+            "-o",
+            "-",
+            YOUTUBE_URL
+        ],
+        {
+            stdio: [
+                "ignore",
+                "pipe",
+                "pipe"
+            ]
         }
+    );
 
-        if (channel.type !== ChannelType.GuildVoice) {
-            throw new Error(
-                "VOICE_CHANNEL_ID ist kein normaler Voice-Channel."
+    ytProcess.stderr.on(
+        "data",
+        data => {
+
+            const text =
+                data.toString().trim();
+
+            if (text) {
+                console.log(
+                    `yt-dlp: ${text}`
+                );
+            }
+        }
+    );
+
+    ytProcess.on(
+        "error",
+        error => {
+
+            console.error(
+                "❌ yt-dlp Fehler:",
+                error.message
             );
+
+            restartStream();
         }
+    );
 
-        console.log(
-            `🔊 Verbinde mit Voice-Channel: ${channel.name}`
-        );
+    ytProcess.on(
+        "close",
+        code => {
 
-        // Alte Verbindung entfernen
-        if (connection) {
-            try {
-                connection.destroy();
-            } catch {}
+            console.log(
+                `yt-dlp beendet (Code ${code})`
+            );
+
+            if (!restarting) {
+                restartStream();
+            }
         }
+    );
 
-        connection = joinVoiceChannel({
-            channelId: channel.id,
-            guildId: guild.id,
-            adapterCreator: guild.voiceAdapterCreator,
+    // =================================================
+    // FFMPEG
+    // =================================================
 
-            // Bot hört nicht selbst mit
-            selfDeaf: true,
+    ffmpegProcess = spawn(
+        ffmpegPath,
+        [
+            "-hide_banner",
+            "-loglevel",
+            "error",
 
-            // Bot sendet Audio
-            selfMute: false
-        });
+            "-i",
+            "pipe:0",
 
-        connection.subscribe(player);
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
 
-        await entersState(
-            connection,
-            VoiceConnectionStatus.Ready,
-            30000
+            "pipe:1"
+        ],
+        {
+            stdio: [
+                "pipe",
+                "pipe",
+                "pipe"
+            ]
+        }
+    );
+
+    // yt-dlp → FFmpeg
+    ytProcess.stdout.pipe(
+        ffmpegProcess.stdin
+    );
+
+    ffmpegProcess.stderr.on(
+        "data",
+        data => {
+
+            const text =
+                data.toString().trim();
+
+            if (text) {
+                console.error(
+                    `FFmpeg: ${text}`
+                );
+            }
+        }
+    );
+
+    ffmpegProcess.on(
+        "error",
+        error => {
+
+            console.error(
+                "❌ FFmpeg Fehler:",
+                error.message
+            );
+
+            restartStream();
+        }
+    );
+
+    // =================================================
+    // DISCORD AUDIO RESOURCE
+    // =================================================
+
+    const resource =
+        createAudioResource(
+            ffmpegProcess.stdout,
+            {
+                inputType:
+                    StreamType.Raw,
+                inlineVolume: true
+            }
         );
 
-        console.log("✅ Erfolgreich mit Discord Voice verbunden!");
+    resource.volume.setVolume(
+        VOLUME
+    );
 
-        reconnecting = false;
+    player.play(resource);
 
-        // Musik starten
-        playMusic();
+    restarting = false;
 
-    } catch (error) {
-
-        reconnecting = false;
-
-        console.error(
-            "❌ Voice-Verbindung fehlgeschlagen:",
-            error.message
-        );
-
-        console.log(
-            "🔄 Neuer Versuch in 10 Sekunden..."
-        );
-
-        setTimeout(connectToVoice, 10000);
-    }
+    console.log(
+        "▶️ YouTube Audio läuft!"
+    );
 }
 
 // =====================================================
-// MUSIK ENDE → AUTOMATISCH NEU STARTEN
+// RESTART STREAM
+// =====================================================
+
+function restartStream() {
+
+    if (restarting) return;
+
+    restarting = true;
+
+    console.log(
+        "🔄 Stream wird neu gestartet..."
+    );
+
+    try {
+        if (ytProcess) {
+            ytProcess.kill("SIGKILL");
+        }
+    } catch {}
+
+    try {
+        if (ffmpegProcess) {
+            ffmpegProcess.kill("SIGKILL");
+        }
+    } catch {}
+
+    setTimeout(() => {
+
+        restarting = false;
+
+        startStream();
+
+    }, 5000);
+}
+
+// =====================================================
+// AUDIO ENDE
 // =====================================================
 
 player.on(
@@ -213,24 +310,15 @@ player.on(
     () => {
 
         console.log(
-            "🔁 Audio beendet – starte wieder von vorne."
+            "🔁 Audio beendet – starte erneut."
         );
 
-        setTimeout(() => {
-
-            if (
-                player.state.status ===
-                AudioPlayerStatus.Idle
-            ) {
-                playMusic();
-            }
-
-        }, 1000);
+        restartStream();
     }
 );
 
 // =====================================================
-// AUDIO FEHLER
+// AUDIO ERROR
 // =====================================================
 
 player.on(
@@ -238,138 +326,187 @@ player.on(
     error => {
 
         console.error(
-            "❌ Audio-Fehler:",
+            "❌ Discord Audio Fehler:",
             error.message
         );
 
-        setTimeout(() => {
-            playMusic();
-        }, 3000);
+        restartStream();
     }
 );
 
 // =====================================================
-// VOICE CONNECTION EVENTS
+// VOICE CONNECTION
 // =====================================================
 
-function setupConnectionEvents() {
+async function connectVoice() {
 
-    if (!connection) return;
+    try {
 
-    connection.on(
-        VoiceConnectionStatus.Ready,
-        () => {
+        const guild =
+            await client.guilds.fetch(
+                GUILD_ID
+            );
 
-            console.log(
-                "🟢 Discord Voice ist bereit."
+        const channel =
+            await guild.channels.fetch(
+                VOICE_CHANNEL_ID
+            );
+
+        if (!channel) {
+            throw new Error(
+                "Voice-Channel nicht gefunden."
             );
         }
-    );
 
-    connection.on(
-        VoiceConnectionStatus.Disconnected,
-        async () => {
-
-            console.log(
-                "⚠️ Discord Voice wurde getrennt."
+        if (
+            channel.type !==
+            ChannelType.GuildVoice
+        ) {
+            throw new Error(
+                "Der Channel ist kein Voice-Channel."
             );
+        }
 
-            try {
+        console.log(
+            `🔊 Verbinde mit ${channel.name}...`
+        );
 
-                // Prüfen, ob Discord die Verbindung
-                // automatisch wiederherstellen kann.
+        connection =
+            joinVoiceChannel({
 
-                await Promise.race([
+                channelId:
+                    channel.id,
 
-                    entersState(
-                        connection,
-                        VoiceConnectionStatus.Signalling,
-                        5000
-                    ),
+                guildId:
+                    guild.id,
 
-                    entersState(
-                        connection,
-                        VoiceConnectionStatus.Connecting,
-                        5000
-                    )
+                adapterCreator:
+                    guild.voiceAdapterCreator,
 
-                ]);
+                selfDeaf: true,
+                selfMute: false
+            });
+
+        connection.subscribe(
+            player
+        );
+
+        await entersState(
+            connection,
+            VoiceConnectionStatus.Ready,
+            30000
+        );
+
+        console.log(
+            "✅ Voice verbunden!"
+        );
+
+        startStream();
+
+        // =================================================
+        // DISCONNECT HANDLING
+        // =================================================
+
+        connection.on(
+            VoiceConnectionStatus.Disconnected,
+            async () => {
 
                 console.log(
-                    "🔄 Discord versucht die Verbindung wiederherzustellen."
-                );
-
-            } catch {
-
-                console.log(
-                    "❌ Verbindung verloren."
+                    "⚠️ Voice getrennt!"
                 );
 
                 try {
-                    connection.destroy();
-                } catch {}
 
-                connection = null;
+                    await Promise.race([
 
-                setTimeout(
-                    connectToVoice,
-                    5000
-                );
+                        entersState(
+                            connection,
+                            VoiceConnectionStatus.Signalling,
+                            5000
+                        ),
+
+                        entersState(
+                            connection,
+                            VoiceConnectionStatus.Connecting,
+                            5000
+                        )
+
+                    ]);
+
+                    console.log(
+                        "🔄 Verbindung wird wiederhergestellt..."
+                    );
+
+                } catch {
+
+                    console.log(
+                        "❌ Reconnect notwendig."
+                    );
+
+                    try {
+                        connection.destroy();
+                    } catch {}
+
+                    connection = null;
+
+                    setTimeout(
+                        connectVoice,
+                        5000
+                    );
+                }
             }
-        }
-    );
+        );
+
+    } catch (error) {
+
+        console.error(
+            "❌ Voice Fehler:",
+            error.message
+        );
+
+        setTimeout(
+            connectVoice,
+            10000
+        );
+    }
 }
 
 // =====================================================
-// BOT ONLINE
+// READY
 // =====================================================
 
 client.once(
     "ready",
     async () => {
 
-        console.log("");
-        console.log("======================================");
-        console.log("       MINECRAFT CHILL RADIO");
-        console.log("======================================");
-
         console.log(
-            `🤖 Bot: ${client.user.tag}`
+            `🤖 Eingeloggt als ${client.user.tag}`
         );
 
-        console.log(
-            `🔊 Voice Channel: ${VOICE_CHANNEL_ID}`
-        );
-
-        console.log(
-            `🔉 Lautstärke: ${Math.round(VOLUME * 100)}%`
-        );
-
-        console.log(
-            `🎵 Datei: ${AUDIO_FILE}`
-        );
-
-        console.log("======================================");
-        console.log("");
-
-        await connectToVoice();
-
-        setupConnectionEvents();
+        await connectVoice();
     }
 );
 
 // =====================================================
-// SAUBER HERUNTERFAHREN
+// SHUTDOWN
 // =====================================================
 
 function shutdown() {
 
     console.log(
-        "🛑 Bot wird heruntergefahren..."
+        "🛑 Bot wird beendet..."
     );
 
     try {
-        player.stop();
+        if (ytProcess) {
+            ytProcess.kill("SIGKILL");
+        }
+    } catch {}
+
+    try {
+        if (ffmpegProcess) {
+            ffmpegProcess.kill("SIGKILL");
+        }
     } catch {}
 
     try {
@@ -386,18 +523,18 @@ function shutdown() {
 }
 
 process.on(
-    "SIGTERM",
-    shutdown
-);
-
-process.on(
     "SIGINT",
     shutdown
 );
 
+process.on(
+    "SIGTERM",
+    shutdown
+);
+
 // =====================================================
-// DISCORD LOGIN
+// LOGIN
 // =====================================================
 
 client.login(TOKEN);
-```
+
